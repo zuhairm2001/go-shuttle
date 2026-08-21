@@ -215,10 +215,11 @@ func (h *batchingHandler) execute(group *batchGroup, batch *pendingBatch) {
 
 		var ctx context.Context
 		for {
-			ctx = liveBatchContext(batch.items)
-			if ctx == nil {
+			item := liveBatchItem(batch.items)
+			if item == nil {
 				return
 			}
+			ctx = item.ctx
 			select {
 			case <-ctx.Done():
 				continue
@@ -230,24 +231,24 @@ func (h *batchingHandler) execute(group *batchGroup, batch *pendingBatch) {
 			group.execution <- struct{}{}
 		}()
 
-		ctx = liveBatchContext(batch.items)
-		if ctx == nil {
+		liveItem := liveBatchItem(batch.items)
+		if liveItem == nil {
 			return
 		}
+		ctx = liveItem.ctx
 
 		messages := make([]*azservicebus.ReceivedMessage, len(batch.items))
 		for i, item := range batch.items {
 			messages[i] = item.message
 		}
-		first := batch.items[0]
-		h.next.Handle(first.ctx, first.settler, messages)
+		h.next.Handle(ctx, liveItem.settler, messages)
 	})
 }
 
-func liveBatchContext(items []*batchItem) context.Context {
+func liveBatchItem(items []*batchItem) *batchItem {
 	for _, item := range items {
 		if item.ctx.Err() == nil {
-			return item.ctx
+			return item
 		}
 	}
 	return nil
