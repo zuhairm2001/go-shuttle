@@ -148,7 +148,7 @@ func (h *batchingHandler) Handle(
 	}
 
 	defer h.release(key, group)
-	h.execute(ctx, group, batch)
+	h.execute(group, batch)
 
 	select {
 	case <-batch.done:
@@ -206,9 +206,13 @@ func (h *batchingHandler) markReadyLocked(group *batchGroup, batch *pendingBatch
 	})
 }
 
-func (h *batchingHandler) execute(ctx context.Context, group *batchGroup, batch *pendingBatch) {
+func (h *batchingHandler) execute(group *batchGroup, batch *pendingBatch) {
 	batch.executeOnce.Do(func() {
 		defer close(batch.done)
+		if len(batch.items) == 0 {
+			return
+		}
+		ctx := batch.items[0].ctx
 
 		select {
 		case <-ctx.Done():
@@ -219,7 +223,7 @@ func (h *batchingHandler) execute(ctx context.Context, group *batchGroup, batch 
 			group.execution <- struct{}{}
 		}()
 
-		if len(batch.items) == 0 || batch.items[0].ctx.Err() != nil {
+		if ctx.Err() != nil {
 			return
 		}
 

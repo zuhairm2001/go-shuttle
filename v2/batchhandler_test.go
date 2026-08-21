@@ -92,6 +92,16 @@ func runBatchMessages(
 	return done
 }
 
+func TestApplyBatchHandlerOptionsDefaults(t *testing.T) {
+	options := applyBatchHandlerOptions(nil)
+	require.Equal(t, 10, options.MaxBatchSize)
+	require.Equal(t, time.Second, options.FlushInterval)
+
+	options = applyBatchHandlerOptions(&BatchHandlerOptions{MaxBatchSize: -1, FlushInterval: -1})
+	require.Equal(t, 10, options.MaxBatchSize)
+	require.Equal(t, time.Second, options.FlushInterval)
+}
+
 func TestBatchHandlerFlushesByCountInReceiveOrder(t *testing.T) {
 	batches := make(chan []string, 1)
 	release := make(chan struct{})
@@ -160,7 +170,7 @@ func TestBatchHandlerSeparatesGroupsAndRunsThemConcurrently(t *testing.T) {
 	release := make(chan struct{})
 	handler := NewBatchHandler(
 		&BatchHandlerOptions{
-			MaxBatchSize: 1,
+			MaxBatchSize:  1,
 			FlushInterval: time.Minute,
 			GroupBy: func(message *azservicebus.ReceivedMessage) string {
 				return *message.CorrelationID
@@ -252,20 +262,22 @@ func TestBatchHandlerCancellationDuringActiveBatch(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("active batch was not released on cancellation")
 	}
+}
 
-	func TestBatchHandlerKeepsLocksRenewingWhileWaiting(t *testing.T) {
-		settler := &batchTestSettler{}
-		handler := NewRenewLockHandler(
-			&LockRenewalOptions{Interval: to.Ptr(2 * time.Millisecond)},
-			NewBatchHandler(
-				&BatchHandlerOptions{MaxBatchSize: 2, FlushInterval: 30 * time.Millisecond},
-				BatchHandlerFunc(func(context.Context, MessageSettler, []*azservicebus.ReceivedMessage) {}),
-			),
-		)
+func TestBatchHandlerKeepsLocksRenewingWhileWaiting(t *testing.T) {
+	settler := &batchTestSettler{}
+	handler := NewRenewLockHandler(
+		&LockRenewalOptions{Interval: to.Ptr(2 * time.Millisecond)},
+		NewBatchHandler(
+			&BatchHandlerOptions{MaxBatchSize: 2, FlushInterval: 30 * time.Millisecond},
+			BatchHandlerFunc(func(context.Context, MessageSettler, []*azservicebus.ReceivedMessage) {}),
+		),
+	)
 
-		<-runBatchMessages(context.Background(), handler, settler, batchMessage("1"))
-		require.Positive(t, settler.renewed.Load())
-	}
+	message := batchMessage("1")
+	message.LockedUntil = to.Ptr(time.Now().Add(time.Minute))
+	<-runBatchMessages(context.Background(), handler, settler, message)
+	require.Positive(t, settler.renewed.Load())
 }
 
 func TestBatchHandlerPanicReleasesAllMessages(t *testing.T) {
@@ -303,39 +315,6 @@ func TestBatchHandlerDeliversEachMessageExactlyOnce(t *testing.T) {
 			for _, message := range messages {
 				seen[message.MessageID]++
 			}
-
-			func TestBatchHandlerFillsAcrossSmallerReceiveCalls(t *testing.T) {
-				receiver := &batchTestReceiver{
-					batchTestSettler: &batchTestSettler{},
-					messages: []*azservicebus.ReceivedMessage{
-						batchMessage("1"),
-						batchMessage("2"),
-						batchMessage("3"),
-					},
-				}
-				received := make(chan int, 1)
-				handler := NewBatchHandler(
-					&BatchHandlerOptions{MaxBatchSize: 3, FlushInterval: time.Second},
-					BatchHandlerFunc(func(_ context.Context, _ MessageSettler, messages []*azservicebus.ReceivedMessage) {
-						received <- len(messages)
-					}),
-				)
-				interval := time.Millisecond
-				processor := NewProcessor(receiver, handler, &ProcessorOptions{
-					MaxConcurrency:  3,
-					MaxReceiveCount: 1,
-					ReceiveInterval: &interval,
-				})
-				ctx, cancel := context.WithCancel(context.Background())
-				finished := make(chan error, 1)
-				go func() {
-					finished <- processor.Start(ctx)
-				}()
-
-				require.Equal(t, 3, <-received)
-				cancel()
-				require.ErrorIs(t, <-finished, context.Canceled)
-			}
 		}),
 	)
 	messages := make([]*azservicebus.ReceivedMessage, messageCount)
@@ -348,6 +327,39 @@ func TestBatchHandlerDeliversEachMessageExactlyOnce(t *testing.T) {
 	for _, count := range seen {
 		require.Equal(t, 1, count)
 	}
+}
+
+func TestBatchHandlerFillsAcrossSmallerReceiveCalls(t *testing.T) {
+	receiver := &batchTestReceiver{
+		batchTestSettler: &batchTestSettler{},
+		messages: []*azservicebus.ReceivedMessage{
+			batchMessage("1"),
+			batchMessage("2"),
+			batchMessage("3"),
+		},
+	}
+	received := make(chan int, 1)
+	handler := NewBatchHandler(
+		&BatchHandlerOptions{MaxBatchSize: 3, FlushInterval: time.Second},
+		BatchHandlerFunc(func(_ context.Context, _ MessageSettler, messages []*azservicebus.ReceivedMessage) {
+			received <- len(messages)
+		}),
+	)
+	interval := time.Millisecond
+	processor := NewProcessor(receiver, handler, &ProcessorOptions{
+		MaxConcurrency:  3,
+		MaxReceiveCount: 1,
+		ReceiveInterval: &interval,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() {
+		finished <- processor.Start(ctx)
+	}()
+
+	require.Equal(t, 3, <-received)
+	cancel()
+	require.ErrorIs(t, <-finished, context.Canceled)
 }
 
 func TestBatchSettlementHandlerAppliesIndependentSettlements(t *testing.T) {
