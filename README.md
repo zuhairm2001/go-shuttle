@@ -67,6 +67,74 @@ shuttle.NewRenewLockHandler(&shuttle.LockRenewalOptions{Interval: &renewInterval
 
 see setup in [Processor example](v2/processor_test.go)
 
+## Batched message handling
+
+`NewBatchHandler` adapts the processor's single-message handler API to an
+ordered batch handler. A non-empty batch is flushed when either
+`MaxBatchSize` is reached or `FlushInterval` has elapsed since the first
+message entered that group. `GroupBy` can optionally create independent batch
+streams from a correlation ID, session ID, or application property; batches
+for one key are serialized while different keys may execute concurrently.
+
+```golang
+batchOptions := &shuttle.BatchHandlerOptions{
+    MaxBatchSize:  10,
+    FlushInterval: 5 * time.Second,
+    GroupBy: func(message *azservicebus.ReceivedMessage) string {
+        if message.CorrelationID == nil {
+            return ""
+        }
+        return *message.CorrelationID
+    },
+}
+processorOptions := &shuttle.ProcessorOptions{
+    MaxConcurrency:  20,
+    MaxReceiveCount: 10,
+}
+if err := batchOptions.ValidateProcessorOptions(processorOptions); err != nil {
+    return err
+}
+
+batchHandler := shuttle.NewBatchHandler(batchOptions,
+    shuttle.NewBatchSettlementHandler(nil, myBatchSettler))
+handler := shuttle.NewPanicHandler(nil,
+    shuttle.NewRenewLockHandler(nil, batchHandler))
+processor := shuttle.NewProcessor(receiver, handler, processorOptions)
+```
+
+See the complete setup in
+[the batch handler example](v2/batchhandler_example_test.go).
+
+### Operational considerations
+
+- Configure `MaxConcurrency` to be at least `MaxBatchSize`. Every buffered
+  message occupies a processor concurrency slot, which bounds the in-memory
+  queue. Multiple grouping keys can divide those slots, so keep the timed flush
+  enabled.
+- `MaxReceiveCount` controls how many messages each receiver call requests. It
+  neither defines batch size nor guarantees Azure Service Bus returns that many
+  messages.
+- Put panic recovery outside lock renewal, and lock renewal outside batching,
+  as shown above. This renews every message lock while it waits and while its
+  batch runs.
+- Azure Service Bus has no atomic settlement operation for received batches.
+  Settle every message independently. Partial success is therefore possible:
+  successful messages can be completed while failed messages are abandoned,
+  deferred, or dead-lettered. An unsettled message remains locked until expiry.
+- Context cancellation releases messages still waiting for a batch without
+  settling them, allowing Service Bus to redeliver them.
+
+### Routing message types
+
+Batching does not filter messages after receipt. Route the desired type at the
+broker: send it to a dedicated queue, or configure a topic subscription rule
+for the `"type"` application property populated by `Sender`. This avoids
+holding unrelated messages in the receiver.
+
+Grouping by `SessionID` only creates in-process batches; it does not establish
+Azure Service Bus session ownership or ordering. Use a session-capable receiver
+when broker-level session guarantees are required.
+
 ## Contributing
 
 This project welcomes contributions and suggestions.  Most contributions require you to agree to a
