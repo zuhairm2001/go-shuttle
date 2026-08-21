@@ -212,18 +212,26 @@ func (h *batchingHandler) execute(group *batchGroup, batch *pendingBatch) {
 		if len(batch.items) == 0 {
 			return
 		}
-		ctx := batch.items[0].ctx
 
-		select {
-		case <-ctx.Done():
-			return
-		case <-group.execution:
+		var ctx context.Context
+		for {
+			ctx = liveBatchContext(batch.items)
+			if ctx == nil {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				continue
+			case <-group.execution:
+			}
+			break
 		}
 		defer func() {
 			group.execution <- struct{}{}
 		}()
 
-		if ctx.Err() != nil {
+		ctx = liveBatchContext(batch.items)
+		if ctx == nil {
 			return
 		}
 
@@ -234,6 +242,15 @@ func (h *batchingHandler) execute(group *batchGroup, batch *pendingBatch) {
 		first := batch.items[0]
 		h.next.Handle(first.ctx, first.settler, messages)
 	})
+}
+
+func liveBatchContext(items []*batchItem) context.Context {
+	for _, item := range items {
+		if item.ctx.Err() == nil {
+			return item.ctx
+		}
+	}
+	return nil
 }
 
 func (h *batchingHandler) removePending(
@@ -316,11 +333,14 @@ func NewBatchSettlementHandler(
 		messages []*azservicebus.ReceivedMessage,
 		settlements []Settlement,
 	) []Settlement {
-		panic(fmt.Sprintf(
-			"batch handler returned %d settlements for %d messages or included a nil settlement",
-			len(settlements),
-			len(messages),
-		))
+		if len(settlements) != len(messages) {
+			panic(fmt.Sprintf(
+				"batch handler returned %d settlements for %d messages",
+				len(settlements),
+				len(messages),
+			))
+		}
+		panic("batch handler returned a nil settlement")
 	}
 	if options != nil && options.OnInvalidSettlements != nil {
 		onInvalid = options.OnInvalidSettlements
